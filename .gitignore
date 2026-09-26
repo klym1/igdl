@@ -1,0 +1,5 @@
+.venv/
+downloads/
+cookies.txt
+__pycache__/
+gallery-dl/
