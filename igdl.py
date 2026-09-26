@@ -14,14 +14,18 @@ Usage:
     python igdl.py liked
     python igdl.py liked --count 50 --dry-run
 
+    # same, for posts you saved
+    python igdl.py saved
+
     # backfill from an Instagram "Download your information" export (real like times)
     python igdl.py export instagram-export.zip --hours 24
 
-On "liked in the last hour": Instagram's liked feed is ordered by when you liked each
-post, but carries no like timestamp -- only the post's own creation time, which is
-unrelated. So a wall-clock window is not available there. Instead this remembers what it
-has already fetched in <out>/.igdl-liked.json and takes whatever is new. Run it on a
-schedule and each run covers the period since the previous one.
+On "liked in the last hour": Instagram's liked and saved feeds are ordered by when you
+liked or saved each post, but carry no such timestamp -- only the post's own creation
+time, which is unrelated. So a wall-clock window is not available there. Instead this
+remembers what it has already fetched, in <out>/.igdl-liked.json and
+<out>/.igdl-saved.json respectively, and takes whatever is new. Run it on a schedule and
+each run covers the period since the previous one.
 
 The export path is the only source with true like timestamps, so --hours works there,
 but an export takes hours or days to generate and is stale on arrival.
@@ -59,8 +63,21 @@ MOBILE_UA = (
     "samsung; SM-G991B; o1s; exynos2100; en_US; 458229258)"
 )
 IG_APP_ID = "936619743392459"
-LIKED_FEED = "https://www.instagram.com/api/v1/feed/liked/"
-STATE_FILE = ".igdl-liked.json"
+
+# Both feeds answer the same headers and paginate the same way, but their items differ:
+# the liked feed's items *are* the media, the saved feed wraps each in {"media": {...}}.
+# Neither carries a like/save timestamp, so their ordering is the only recency signal.
+FEEDS = {
+    "liked": "https://www.instagram.com/api/v1/feed/liked/",
+    "saved": "https://www.instagram.com/api/v1/feed/saved/posts/",
+}
+# One state file per feed: a post can be both liked and saved, and sharing a file would
+# make whichever ran first hide it from the other.
+STATE_FILES = {"liked": ".igdl-liked.json", "saved": ".igdl-saved.json"}
+
+
+def state_file(mode: str) -> str:
+    return STATE_FILES.get(mode, ".igdl-liked.json")
 
 
 # --------------------------------------------------------------------------- urls
@@ -108,9 +125,10 @@ def files_under(out_dir: Path) -> dict[Path, int]:
     """Every file below out_dir mapped to its size, so runs can be diffed by content."""
     if not out_dir.exists():
         return {}
+    known_state = set(STATE_FILES.values())
     found: dict[Path, int] = {}
     for p in out_dir.rglob("*"):
-        if p.is_file() and p.name != STATE_FILE:
+        if p.is_file() and p.name not in known_state:
             try:
                 found[p.resolve()] = p.stat().st_size
             except OSError:  # vanished between the glob and the stat
@@ -240,47 +258,62 @@ def api_get(opener: urllib.request.OpenerDirector, url: str, params: dict[str, s
     return cast("dict[str, object]", parsed)
 
 
-def iter_liked_shortcodes(opener: urllib.request.OpenerDirector, limit: int) -> Iterator[str]:
-    """Yield shortcodes from the liked feed, most recently liked first.
+def item_shortcode(raw: object) -> str | None:
+    """The shortcode of one feed item, whether or not it is wrapped in a "media" object."""
+    if not isinstance(raw, dict):
+        return None
+    fields = cast("dict[str, object]", raw)
+    inner = fields.get("media")
+    if isinstance(inner, dict):
+        fields = cast("dict[str, object]", inner)
+    code = fields.get("code")
+    return code if isinstance(code, str) else None
 
-    The feed carries no like timestamps, so ordering is the only recency signal.
+
+def iter_feed_shortcodes(
+    opener: urllib.request.OpenerDirector, mode: str, limit: int
+) -> Iterator[str]:
+    """Yield shortcodes from the liked or saved feed, most recent action first.
+
+    Neither feed carries a like/save timestamp, so ordering is the only recency signal.
     """
+    url = FEEDS[mode]
     max_id: str | None = None
     seen = 0
     page_no = 0
-    log.info("reading liked feed (up to %d most recent like(s))", limit)
+    log.info("reading %s feed (up to %d most recent)", mode, limit)
     while seen < limit:
         params = {"count": "30"}
         if max_id:
             params["max_id"] = max_id
         page_no += 1
-        page = api_get(opener, LIKED_FEED, params)
+        page = api_get(opener, url, params)
         items = page.get("items")
         if not isinstance(items, list):
-            log.warning("liked feed page %d had no items; stopping", page_no)
+            log.warning("%s feed page %d had no items; stopping", mode, page_no)
             return
         entries = cast("list[object]", items)
         log.info("  page %d: %d item(s) (%d read so far)", page_no, len(entries), seen + len(entries))
         for raw in entries:
-            if not isinstance(raw, dict):
+            code = item_shortcode(raw)
+            if code is None:
+                log.debug("  item without a shortcode, skipping")
                 continue
-            code = cast("dict[str, object]", raw).get("code")
-            if isinstance(code, str):
-                yield code
-                seen += 1
-                if seen >= limit:
-                    log.debug("reached --count %d, stopping after page %d", limit, page_no)
-                    return
+            yield code
+            seen += 1
+            if seen >= limit:
+                log.debug("reached --count %d, stopping after page %d", limit, page_no)
+                return
         nxt = page.get("next_max_id")
         if not page.get("more_available") or not isinstance(nxt, str):
-            log.info("  reached the end of the liked feed after %d item(s)", seen)
+            log.info("  reached the end of the %s feed after %d item(s)", mode, seen)
             return
         max_id = nxt
         time.sleep(1)  # be gentle on a private endpoint
 
 
-def load_state(out_dir: Path) -> set[str]:
-    path = out_dir / STATE_FILE
+def load_state(out_dir: Path, mode: str) -> set[str]:
+    path = out_dir / state_file(mode)
     if not path.is_file():
         log.debug("no state file at %s", path)
         return set()
@@ -296,15 +329,15 @@ def load_state(out_dir: Path) -> set[str]:
         if isinstance(codes, list):
             known = {c for c in cast("list[object]", codes) if isinstance(c, str)}
             when = f", last updated {stamp(updated)}" if isinstance(updated, int) else ""
-            log.info("state: %d post(s) already fetched%s", len(known), when)
+            log.info("state (%s): %d post(s) already fetched%s", mode, len(known), when)
             return known
     log.warning("state file %s has an unexpected shape; treating it as empty", path)
     return set()
 
 
-def save_state(out_dir: Path, codes: set[str]) -> None:
+def save_state(out_dir: Path, codes: set[str], mode: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / STATE_FILE
+    path = out_dir / state_file(mode)
     payload = {"fetched": sorted(codes), "updated": int(time.time())}
     try:
         _ = path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
@@ -418,7 +451,7 @@ class Args(argparse.Namespace):
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Download Instagram posts, reels, and your recent likes.")
-    subs = ap.add_subparsers(dest="mode", required=True, metavar="{post,liked,export}")
+    subs = ap.add_subparsers(dest="mode", required=True, metavar="{post,liked,saved,export}")
 
     # Defaults are taken from Args so that class stays the single source of truth. They
     # must be passed explicitly here: a subparser parses into a fresh namespace and copies
@@ -441,11 +474,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = subs.add_parser("post", parents=[common], help="download specific post/reel URLs")
     _ = p.add_argument("urls", nargs="+", help="one or more Instagram post or reel URLs")
 
-    liked = subs.add_parser("liked", parents=[common], help="download posts you liked since the last run")
-    _ = liked.add_argument("--count", type=int, default=Args.count,
-                           help="how many recent likes to examine (default: 60)")
-    _ = liked.add_argument("--again", action="store_true", default=Args.again,
-                           help="ignore saved state and re-fetch")
+    # liked and saved differ only in which feed they read, so they take the same options
+    for name, what in (("liked", "liked"), ("saved", "saved")):
+        sub = subs.add_parser(
+            name, parents=[common], help=f"download posts you {what} since the last run"
+        )
+        _ = sub.add_argument("--count", type=int, default=Args.count,
+                             help=f"how many recent {what} posts to examine (default: 60)")
+        _ = sub.add_argument("--again", action="store_true", default=Args.again,
+                             help="ignore recorded state and re-fetch")
 
     exp = subs.add_parser("export", parents=[common], help="download likes from a data export")
     _ = exp.add_argument("source", help="export .zip, its extracted folder, or liked_posts.json")
@@ -465,22 +502,22 @@ def collect_urls(args: Args) -> tuple[list[str], set[str]]:
 
     out_dir = Path(args.out)
     if args.again:
-        log.info("--again given: ignoring saved state, every like found counts as new")
+        log.info("--again given: ignoring recorded state, every post found counts as new")
         already: set[str] = set()
     else:
-        already = load_state(out_dir)
+        already = load_state(out_dir, args.mode)
         if not already:
             log.warning(
-                "no previous state in %s; treating the %d most recent likes as new."
-                + " Later runs will only pick up what you liked since this one.",
-                out_dir / STATE_FILE, args.count,
+                "no previous state in %s; treating the %d most recent %s posts as new."
+                + " Later runs will only pick up what changed since this one.",
+                out_dir / state_file(args.mode), args.count, args.mode,
             )
     opener = open_session(Path(args.cookies))
-    examined = list(iter_liked_shortcodes(opener, args.count))
+    examined = list(iter_feed_shortcodes(opener, args.mode, args.count))
     fresh = [c for c in examined if c not in already]
     log.info(
-        "examined %d like(s): %d already fetched, %d new",
-        len(examined), len(examined) - len(fresh), len(fresh),
+        "examined %d %s post(s): %d already fetched, %d new",
+        len(examined), args.mode, len(examined) - len(fresh), len(fresh),
     )
     return [post_url(c) for c in fresh], set(fresh)
 
@@ -515,10 +552,13 @@ def main() -> None:
 
     urls, new_codes = collect_urls(args)
     if not urls:
-        if args.mode == "liked":
+        if args.mode in FEEDS:
             # Not an error: a scheduled hourly run finding nothing is the normal case,
             # and a non-zero exit would look like a failure to the scheduler.
-            log.info("nothing new: no likes since the last run (%.1fs)", time.monotonic() - started)
+            log.info(
+                "nothing new: no %s posts since the last run (%.1fs)",
+                args.mode, time.monotonic() - started,
+            )
             return
         if args.mode == "export":
             sys.exit(
@@ -546,7 +586,7 @@ def main() -> None:
     # Record progress after every post, not once at the end: a run interrupted part way
     # through then keeps what it already got instead of starting over next time. A post
     # that failed is left unrecorded, so the next run retries it.
-    recorded: set[str] = load_state(out_dir) if new_codes else set()
+    recorded: set[str] = load_state(out_dir, args.mode) if new_codes else set()
     failures = 0
     for i, url in enumerate(urls, 1):
         log.info("[%d/%d] %s", i, len(urls), url)
@@ -556,8 +596,8 @@ def main() -> None:
         code = shortcode_of(url)
         if code in new_codes:
             recorded.add(code)
-            save_state(out_dir, recorded)
-            log.info("  recorded %s (%d post(s) in state)", code, len(recorded))
+            save_state(out_dir, recorded, args.mode)
+            log.info("  recorded %s (%d post(s) in %s state)", code, len(recorded), args.mode)
 
     convert_webps(out_dir, args.quality, args.keep_webp)
 
