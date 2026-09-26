@@ -48,7 +48,8 @@ def download(url: str, out_dir: Path, cookies: Path) -> list[Path]:
         "-f", "{username}_{shortcode}_{num}.{extension}",
         url,
     ]
-    result = subprocess.run(cmd)
+    # check=False: the non-zero case is handled below with a friendlier message
+    result = subprocess.run(cmd, check=False)
     if result.returncode != 0:
         sys.exit(
             f"gallery-dl failed (exit code {result.returncode})."
@@ -114,7 +115,9 @@ def main() -> None:
             jpg = webp_to_jpg(w, args.quality, args.keep_webp)
             print(f"Converted {w.name} -> {jpg.name}")
             results.append(jpg.resolve())
-        except Exception as e:
+        except (OSError, ValueError) as e:
+            # OSError covers UnidentifiedImageError and truncated/unreadable files;
+            # one bad file should not abort the rest of the batch.
             print(f"Failed to convert {w}: {e}", file=sys.stderr)
 
     print("\nDone:")
