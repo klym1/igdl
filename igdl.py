@@ -33,7 +33,6 @@ import json
 import re
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -78,32 +77,38 @@ def post_url(shortcode: str) -> str:
     return f"https://www.instagram.com/p/{shortcode}/"
 
 
+def shortcode_of(url: str) -> str:
+    """The trailing shortcode of a cleaned post URL, e.g. .../p/ABC123/ -> ABC123."""
+    return url.rstrip("/").rsplit("/", 1)[-1]
+
+
 # ----------------------------------------------------------------------- download
 
 
-def fetch(urls: list[str], out_dir: Path, cookies: Path) -> None:
-    """Run gallery-dl once over every URL, so it authenticates and rate-limits one time."""
+def fetch_one(url: str, out_dir: Path, cookies: Path) -> bool:
+    """Download a single post with gallery-dl. Returns True if it exited cleanly.
+
+    One post per invocation rather than one batch over an input file: that costs an
+    interpreter start per post, but it is what lets the caller record progress between
+    posts, so an interrupted run does not have to be redone from the beginning.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
-        _ = fh.write("\n".join(urls))
-        listfile = Path(fh.name)
-    try:
-        cmd = [
-            sys.executable, "-m", "gallery_dl",
-            "--cookies", str(cookies),
-            "-D", str(out_dir),   # save straight into out_dir, no nested folders
-            "-f", "{username}_{shortcode}_{num}.{extension}",
-            "-i", str(listfile),  # gallery-dl skips already-downloaded files by default
-        ]
-        result = subprocess.run(cmd, check=False)
-        if result.returncode != 0:
-            print(
-                f"gallery-dl exited {result.returncode}; some posts may have been skipped."
-                + " If it redirected to login, re-export cookies.txt.",
-                file=sys.stderr,
-            )
-    finally:
-        listfile.unlink(missing_ok=True)
+    cmd = [
+        sys.executable, "-m", "gallery_dl",
+        "--cookies", str(cookies),
+        "-D", str(out_dir),   # save straight into out_dir, no nested folders
+        "-f", "{username}_{shortcode}_{num}.{extension}",
+        url,                  # gallery-dl skips already-downloaded files by default
+    ]
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        print(
+            f"gallery-dl exited {result.returncode} for {url}; leaving it unrecorded so the"
+            + " next run retries it. If it redirected to login, re-export cookies.txt.",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def webp_to_jpg(path: Path, quality: int, keep_webp: bool) -> Path:
@@ -396,15 +401,27 @@ def main() -> None:
     if out_dir.exists():
         before = {p.resolve() for p in out_dir.rglob("*") if p.is_file()}
 
-    fetch(urls, out_dir, cookies)
-    convert_webps(out_dir, args.quality, args.keep_webp)
+    # Record progress after every post, not once at the end: a run interrupted part way
+    # through then keeps what it already got instead of starting over next time. A post
+    # that failed is left unrecorded, so the next run retries it.
+    recorded: set[str] = load_state(out_dir) if new_codes else set()
+    failures = 0
+    for i, url in enumerate(urls, 1):
+        print(f"\n[{i}/{len(urls)}] {url}")
+        if not fetch_one(url, out_dir, cookies):
+            failures += 1
+            continue
+        code = shortcode_of(url)
+        if code in new_codes:
+            recorded.add(code)
+            save_state(out_dir, recorded)
 
-    if new_codes:
-        save_state(out_dir, load_state(out_dir) | new_codes)
+    convert_webps(out_dir, args.quality, args.keep_webp)
 
     after = {p.resolve() for p in out_dir.rglob("*") if p.is_file()}
     added = sorted(p for p in after - before if p.name != STATE_FILE)
-    print(f"\nDone: {len(added)} new file(s)")
+    suffix = f", {failures} post(s) failed" if failures else ""
+    print(f"\nDone: {len(added)} new file(s){suffix}")
     for p in added:
         print(f"  {p}")
 
