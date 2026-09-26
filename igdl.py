@@ -28,9 +28,12 @@ but an export takes hours or days to generate and is stale on arrival.
 """
 
 import argparse
+import datetime as dt
 import http.cookiejar
 import json
+import logging
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -44,6 +47,8 @@ from pathlib import Path
 from typing import ClassVar, cast
 
 from PIL import Image
+
+log = logging.getLogger("igdl")
 
 POST_URL = re.compile(r"^https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/[^/?#]+", re.IGNORECASE)
 
@@ -82,6 +87,37 @@ def shortcode_of(url: str) -> str:
     return url.rstrip("/").rsplit("/", 1)[-1]
 
 
+# ------------------------------------------------------------------------ logging
+
+
+def human_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def stamp(ts: float) -> str:
+    # tz-aware then converted to local time, so logs read in the reader's own clock
+    return dt.datetime.fromtimestamp(ts, tz=dt.UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def files_under(out_dir: Path) -> dict[Path, int]:
+    """Every file below out_dir mapped to its size, so runs can be diffed by content."""
+    if not out_dir.exists():
+        return {}
+    found: dict[Path, int] = {}
+    for p in out_dir.rglob("*"):
+        if p.is_file() and p.name != STATE_FILE:
+            try:
+                found[p.resolve()] = p.stat().st_size
+            except OSError:  # vanished between the glob and the stat
+                continue
+    return found
+
+
 # ----------------------------------------------------------------------- download
 
 
@@ -100,14 +136,27 @@ def fetch_one(url: str, out_dir: Path, cookies: Path) -> bool:
         "-f", "{username}_{shortcode}_{num}.{extension}",
         url,                  # gallery-dl skips already-downloaded files by default
     ]
+    log.debug("running: %s", " ".join(cmd))
+    started = time.monotonic()
+    before = files_under(out_dir)
     result = subprocess.run(cmd, check=False)
+    elapsed = time.monotonic() - started
+    added = {p: n for p, n in files_under(out_dir).items() if p not in before}
+
     if result.returncode != 0:
-        print(
-            f"gallery-dl exited {result.returncode} for {url}; leaving it unrecorded so the"
-            + " next run retries it. If it redirected to login, re-export cookies.txt.",
-            file=sys.stderr,
+        log.error(
+            "gallery-dl exited %d after %.1fs for %s; leaving it unrecorded so the next run"
+            + " retries it. If it redirected to login, re-export cookies.txt.",
+            result.returncode, elapsed, url,
         )
         return False
+
+    if added:
+        log.info("  +%d file(s), %s in %.1fs", len(added), human_bytes(sum(added.values())), elapsed)
+        for p in sorted(added):
+            log.debug("    %s (%s)", p.name, human_bytes(added[p]))
+    else:
+        log.info("  nothing new in %.1fs (already downloaded)", elapsed)
     return True
 
 
@@ -128,14 +177,25 @@ def webp_to_jpg(path: Path, quality: int, keep_webp: bool) -> Path:
 
 
 def convert_webps(out_dir: Path, quality: int, keep_webp: bool) -> None:
-    for webp in sorted(out_dir.rglob("*.webp")):
+    webps = sorted(out_dir.rglob("*.webp"))
+    if not webps:
+        log.debug("no .webp files to convert in %s", out_dir)
+        return
+    log.info("converting %d .webp file(s) to .jpg at quality %d", len(webps), quality)
+    converted = failed = 0
+    for webp in webps:
         try:
             jpg = webp_to_jpg(webp, quality, keep_webp)
-            print(f"Converted {webp.name} -> {jpg.name}")
         except (OSError, ValueError) as e:
             # OSError covers UnidentifiedImageError and truncated/unreadable files;
             # one bad file should not abort the rest of the batch.
-            print(f"Failed to convert {webp}: {e}", file=sys.stderr)
+            log.error("failed to convert %s: %s", webp, e)
+            failed += 1
+            continue
+        converted += 1
+        log.debug("  %s -> %s (%s)", webp.name, jpg.name, human_bytes(jpg.stat().st_size))
+    log.info("converted %d, failed %d%s", converted, failed,
+             "" if keep_webp else " (originals removed)")
 
 
 # -------------------------------------------------------------------- liked feed
@@ -147,8 +207,13 @@ def open_session(cookies: Path) -> urllib.request.OpenerDirector:
         jar.load()
     except OSError as e:
         sys.exit(f"Could not read cookies from {cookies}: {e}")
-    if not any(c.name == "sessionid" for c in jar):
+    names = sorted(c.name for c in jar)
+    if "sessionid" not in names:
         sys.exit(f"No sessionid cookie in {cookies}; re-export it while logged in.")
+    log.info("loaded %d cookie(s) from %s: %s", len(names), cookies, ", ".join(names))
+    expiries = [c.expires for c in jar if c.name == "sessionid" and c.expires]
+    if expiries:
+        log.info("sessionid expires %s", stamp(min(expiries)))
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
@@ -182,15 +247,21 @@ def iter_liked_shortcodes(opener: urllib.request.OpenerDirector, limit: int) -> 
     """
     max_id: str | None = None
     seen = 0
+    page_no = 0
+    log.info("reading liked feed (up to %d most recent like(s))", limit)
     while seen < limit:
         params = {"count": "30"}
         if max_id:
             params["max_id"] = max_id
+        page_no += 1
         page = api_get(opener, LIKED_FEED, params)
         items = page.get("items")
         if not isinstance(items, list):
+            log.warning("liked feed page %d had no items; stopping", page_no)
             return
-        for raw in cast("list[object]", items):
+        entries = cast("list[object]", items)
+        log.info("  page %d: %d item(s) (%d read so far)", page_no, len(entries), seen + len(entries))
+        for raw in entries:
             if not isinstance(raw, dict):
                 continue
             code = cast("dict[str, object]", raw).get("code")
@@ -198,9 +269,11 @@ def iter_liked_shortcodes(opener: urllib.request.OpenerDirector, limit: int) -> 
                 yield code
                 seen += 1
                 if seen >= limit:
+                    log.debug("reached --count %d, stopping after page %d", limit, page_no)
                     return
         nxt = page.get("next_max_id")
         if not page.get("more_available") or not isinstance(nxt, str):
+            log.info("  reached the end of the liked feed after %d item(s)", seen)
             return
         max_id = nxt
         time.sleep(1)  # be gentle on a private endpoint
@@ -209,16 +282,23 @@ def iter_liked_shortcodes(opener: urllib.request.OpenerDirector, limit: int) -> 
 def load_state(out_dir: Path) -> set[str]:
     path = out_dir / STATE_FILE
     if not path.is_file():
+        log.debug("no state file at %s", path)
         return set()
     try:
         parsed = cast("object", json.loads(path.read_bytes()))
     except (OSError, ValueError) as e:
-        print(f"Ignoring unreadable state file {path}: {e}", file=sys.stderr)
+        log.warning("ignoring unreadable state file %s: %s", path, e)
         return set()
     if isinstance(parsed, dict):
-        codes = cast("dict[str, object]", parsed).get("fetched")
+        fields = cast("dict[str, object]", parsed)
+        codes = fields.get("fetched")
+        updated = fields.get("updated")
         if isinstance(codes, list):
-            return {c for c in cast("list[object]", codes) if isinstance(c, str)}
+            known = {c for c in cast("list[object]", codes) if isinstance(c, str)}
+            when = f", last updated {stamp(updated)}" if isinstance(updated, int) else ""
+            log.info("state: %d post(s) already fetched%s", len(known), when)
+            return known
+    log.warning("state file %s has an unexpected shape; treating it as empty", path)
     return set()
 
 
@@ -229,7 +309,9 @@ def save_state(out_dir: Path, codes: set[str]) -> None:
     try:
         _ = path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
     except OSError as e:
-        print(f"Could not write state file {path}: {e}", file=sys.stderr)
+        log.error("could not write state file %s: %s", path, e)
+        return
+    log.debug("state saved: %d post(s) recorded in %s", len(codes), path)
 
 
 # ------------------------------------------------------------------ export source
@@ -282,15 +364,33 @@ def recent_liked_urls(raw: bytes, hours: float) -> list[str]:
     """Post URLs liked within the last `hours`, newest like first, de-duplicated."""
     data = cast("object", json.loads(raw))
     cutoff = time.time() - hours * 3600
+    entries = sorted(walk_likes(data), reverse=True)
+    log.info("export holds %d like(s)", len(entries))
+    if entries:
+        log.info("  spanning %s to %s", stamp(entries[-1][0]), stamp(entries[0][0]))
+    log.info("keeping likes newer than %s (--hours %g)", stamp(cutoff), hours)
+
     seen: set[str] = set()
     urls: list[str] = []
-    for ts, href in sorted(walk_likes(data), reverse=True):
-        if ts < cutoff or not POST_URL.match(href):
+    skipped_old = skipped_nonpost = 0
+    for ts, href in entries:
+        if ts < cutoff:
+            skipped_old += 1
+            continue
+        if not POST_URL.match(href):
+            skipped_nonpost += 1
+            log.debug("  not a post URL, skipping: %s", href)
             continue
         url = href.split("?")[0].rstrip("/") + "/"
-        if url not in seen:
-            seen.add(url)
-            urls.append(url)
+        if url in seen:
+            log.debug("  duplicate like on %s, already queued", url)
+            continue
+        seen.add(url)
+        urls.append(url)
+    log.info(
+        "  %d in window, %d outside it, %d not post URLs, %d duplicate(s) collapsed",
+        len(urls), skipped_old, skipped_nonpost, len(entries) - skipped_old - skipped_nonpost - len(urls),
+    )
     return urls
 
 
@@ -312,6 +412,8 @@ class Args(argparse.Namespace):
     quality: int = 92
     keep_webp: bool = False
     dry_run: bool = False
+    verbose: bool = False
+    quiet: bool = False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -331,6 +433,10 @@ def build_parser() -> argparse.ArgumentParser:
                             help="keep original .webp files")
     _ = common.add_argument("--dry-run", action="store_true", default=Args.dry_run,
                             help="list what would download, then stop")
+    _ = common.add_argument("-v", "--verbose", action="store_true", default=Args.verbose,
+                            help="log every file, request and skip decision")
+    _ = common.add_argument("--quiet", action="store_true", default=Args.quiet,
+                            help="only log warnings and errors")
 
     p = subs.add_parser("post", parents=[common], help="download specific post/reel URLs")
     _ = p.add_argument("urls", nargs="+", help="one or more Instagram post or reel URLs")
@@ -358,19 +464,50 @@ def collect_urls(args: Args) -> tuple[list[str], set[str]]:
         return recent_liked_urls(find_likes_json(Path(args.source)), args.hours), set()
 
     out_dir = Path(args.out)
-    already: set[str] = set() if args.again else load_state(out_dir)
-    if not already and not args.again:
-        print(
-            f"No previous state in {out_dir / STATE_FILE}; treating the {args.count} most recent"
-            + " likes as new. Later runs will only pick up what you liked since this one."
-        )
+    if args.again:
+        log.info("--again given: ignoring saved state, every like found counts as new")
+        already: set[str] = set()
+    else:
+        already = load_state(out_dir)
+        if not already:
+            log.warning(
+                "no previous state in %s; treating the %d most recent likes as new."
+                + " Later runs will only pick up what you liked since this one.",
+                out_dir / STATE_FILE, args.count,
+            )
     opener = open_session(Path(args.cookies))
-    fresh = [c for c in iter_liked_shortcodes(opener, args.count) if c not in already]
+    examined = list(iter_liked_shortcodes(opener, args.count))
+    fresh = [c for c in examined if c not in already]
+    log.info(
+        "examined %d like(s): %d already fetched, %d new",
+        len(examined), len(examined) - len(fresh), len(fresh),
+    )
     return [post_url(c) for c in fresh], set(fresh)
+
+
+def setup_logging(verbose: bool, quiet: bool) -> None:
+    """Timestamped logging: a scheduled run's output needs to say when each step happened."""
+    level = logging.DEBUG if verbose else logging.WARNING if quiet else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
 
 
 def main() -> None:
     args = build_parser().parse_args(namespace=Args())
+    setup_logging(args.verbose, args.quiet)
+    started = time.monotonic()
+
+    out_dir = Path(args.out)
+    log.info("igdl %s mode -> %s", args.mode, out_dir.resolve())
+    if args.mode == "export":
+        log.info("source %s, window %g hour(s)", Path(args.source).resolve(), args.hours)
+    else:
+        log.info("cookies %s", Path(args.cookies).resolve())
+    log.debug("full settings: %s", vars(args))
 
     cookies = Path(args.cookies)
     if args.mode != "export" and not cookies.is_file():
@@ -381,7 +518,7 @@ def main() -> None:
         if args.mode == "liked":
             # Not an error: a scheduled hourly run finding nothing is the normal case,
             # and a non-zero exit would look like a failure to the scheduler.
-            print("Nothing new: no likes since the last run.")
+            log.info("nothing new: no likes since the last run (%.1fs)", time.monotonic() - started)
             return
         if args.mode == "export":
             sys.exit(
@@ -390,16 +527,21 @@ def main() -> None:
             )
         sys.exit("Nothing to download.")
 
-    print(f"{len(urls)} post(s) to download:")
+    log.info("%d post(s) queued:", len(urls))
     for url in urls:
-        print(f"  {url}")
+        log.info("  %s", url)
     if args.dry_run:
+        log.info("--dry-run: stopping without downloading")
         return
 
-    out_dir = Path(args.out)
-    before: set[Path] = set()
-    if out_dir.exists():
-        before = {p.resolve() for p in out_dir.rglob("*") if p.is_file()}
+    if shutil.which("ffmpeg") is None:
+        log.warning(
+            "ffmpeg is not on PATH: reels will arrive as separate video and audio streams"
+            + " instead of one playable file"
+        )
+
+    before = files_under(out_dir)
+    log.info("output folder holds %d file(s) before this run", len(before))
 
     # Record progress after every post, not once at the end: a run interrupted part way
     # through then keeps what it already got instead of starting over next time. A post
@@ -407,7 +549,7 @@ def main() -> None:
     recorded: set[str] = load_state(out_dir) if new_codes else set()
     failures = 0
     for i, url in enumerate(urls, 1):
-        print(f"\n[{i}/{len(urls)}] {url}")
+        log.info("[%d/%d] %s", i, len(urls), url)
         if not fetch_one(url, out_dir, cookies):
             failures += 1
             continue
@@ -415,15 +557,20 @@ def main() -> None:
         if code in new_codes:
             recorded.add(code)
             save_state(out_dir, recorded)
+            log.info("  recorded %s (%d post(s) in state)", code, len(recorded))
 
     convert_webps(out_dir, args.quality, args.keep_webp)
 
-    after = {p.resolve() for p in out_dir.rglob("*") if p.is_file()}
-    added = sorted(p for p in after - before if p.name != STATE_FILE)
-    suffix = f", {failures} post(s) failed" if failures else ""
-    print(f"\nDone: {len(added)} new file(s){suffix}")
-    for p in added:
-        print(f"  {p}")
+    added = {p: n for p, n in files_under(out_dir).items() if p not in before}
+    elapsed = time.monotonic() - started
+    log.info(
+        "done in %.1fs: %d of %d post(s) ok, %d new file(s), %s",
+        elapsed, len(urls) - failures, len(urls), len(added), human_bytes(sum(added.values())),
+    )
+    if failures:
+        log.warning("%d post(s) failed and stay unrecorded; the next run will retry them", failures)
+    for p in sorted(added):
+        log.info("  %s (%s)", p, human_bytes(added[p]))
 
 
 if __name__ == "__main__":
